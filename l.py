@@ -342,7 +342,7 @@ elif st.session_state.page == 'results':
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("<br>")
-    with st.expander("📄 View Optimized Resume Text"):
+    with st.expander("📄 Area where to imporove for better results "):
         st.text_area("", value=res['rewritten_text'], height=300, label_visibility="collapsed")
 
     st.markdown("<br>")
