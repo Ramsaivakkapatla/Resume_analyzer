@@ -1,7 +1,10 @@
 streamlit
-PyPDF2
-scikit-learn
-anthropic
-pandas
+pymupdf
+python-docx
+rapidocr-onnxruntime
+easyocr
+fpdf2
+Pillow
 numpy
-reportlab
+opencv-python
+pytesseract
