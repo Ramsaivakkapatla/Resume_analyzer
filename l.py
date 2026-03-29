@@ -1,358 +1,608 @@
 import streamlit as st
-from PyPDF2 import PdfReader
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
-from reportlab.lib.units import inch
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
-import io, re
+import base64
+import os
+import docx
+import random
+import numpy as np
+import fitz  # PyMuPDF
+from fpdf import FPDF
+from PIL import Image
+import re
+import html
+import string
+import shutil
 
-# ── Page Config ──────────────────────────────
-st.set_page_config(page_title="ResumeIQ", page_icon="⚡", layout="wide")
+# --- High-Performance OCR Fallbacks ---
+try:
+    from rapidocr_onnxruntime import RapidOCR
+    RAPIDOCR_AVAILABLE = True
+except ImportError:
+    RAPIDOCR_AVAILABLE = False
 
-# ── CSS ──────────────────────────────────────
+try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+except ImportError:
+    EASYOCR_AVAILABLE = False
+
+try:
+    import pytesseract
+    PYTESSERACT_AVAILABLE = True
+    
+    # Auto-configure Tesseract path for Windows
+    if os.name == 'nt':
+        common_paths = [
+            r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+            r'C:\Users\\' + os.getlogin() + r'\AppData\Local\Tesseract-OCR\tesseract.exe',
+            r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+            r'C:\Tesseract-OCR\tesseract.exe'
+        ]
+        # Check session state for manual override first
+        manual_path = st.session_state.get("manual_tess_path")
+        if manual_path and os.path.exists(manual_path):
+            pytesseract.pytesseract.tesseract_cmd = manual_path
+        else:
+            # Universal Tesseract discovery
+            tess_path = shutil.which("tesseract")
+            if tess_path:
+                pytesseract.pytesseract.tesseract_cmd = tess_path
+            else:
+                for path in common_paths:
+                    if os.path.exists(path):
+                        pytesseract.pytesseract.tesseract_cmd = path
+                        break
+except ImportError:
+    PYTESSERACT_AVAILABLE = False
+
+def get_ocr_engine():
+    """Lazy-load the OCR engine only when needed."""
+    if not RAPIDOCR_AVAILABLE:
+        return None
+    try:
+        return RapidOCR()
+    except Exception:
+        return None
+
+def get_easyocr_reader():
+    """Lazy-load EasyOCR reader."""
+    if not EASYOCR_AVAILABLE:
+        return None
+    try:
+        return easyocr.Reader(['en'], gpu=False)
+    except Exception:
+        return None
+
+st.set_page_config(page_title="Resume Analyzer", layout="centered")
+
+# -------------------------------
+# Global Glassmorphism Styling
+# -------------------------------
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Sans:wght@300;400;500&display=swap');
-*, *::before, *::after { box-sizing: border-box; }
-html, body, .stApp { font-family: 'DM Sans', sans-serif; background: #05080f; color: #e8ecf4; }
-#MainMenu, footer, header { visibility: hidden; }
-.block-container { padding: 2rem 3rem !important; max-width: 1100px !important; margin: auto; }
-section[data-testid="stSidebar"] { display: none !important; }
-
-.brand { font-family:'Syne',sans-serif; font-size:1.4rem; font-weight:800;
-         background:linear-gradient(135deg,#60a5fa,#a78bfa,#34d399);
-         -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
-
-.hero-title { font-family:'Syne',sans-serif; font-size:clamp(2.2rem,5vw,4rem);
-              font-weight:800; line-height:1.1; color:#f0f4ff; }
-.hero-title span { background:linear-gradient(135deg,#60a5fa,#a78bfa);
-                   -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
-.hero-sub { color:#94a3b8; font-size:1rem; line-height:1.7; max-width:500px; }
-
-.card { background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08);
-        border-radius:18px; padding:1.8rem; margin-bottom:1rem; }
-
-.score-num { font-family:'Syne',sans-serif; font-size:4rem; font-weight:800; line-height:1; }
-.badge { display:inline-block; padding:.25rem .8rem; border-radius:99px; font-size:.75rem; font-weight:500; }
-
-.chip { background:rgba(59,130,246,.1); border:1px solid rgba(59,130,246,.25);
-        color:#60a5fa; font-size:.75rem; padding:.2rem .65rem; border-radius:99px;
-        display:inline-block; margin:.2rem; }
-
-div.stButton > button {
-    background:linear-gradient(135deg,#3b82f6,#6366f1) !important; color:white !important;
-    font-family:'Syne',sans-serif !important; font-weight:600 !important;
-    border:none !important; border-radius:12px !important; padding:.8rem 2rem !important;
-    box-shadow:0 4px 20px rgba(99,102,241,.3) !important; transition:all .3s !important; }
-div.stButton > button:hover { transform:translateY(-2px) !important; }
-
-[data-testid="stDownloadButton"] button {
-    background:linear-gradient(135deg,#059669,#10b981) !important; color:white !important;
-    font-family:'Syne',sans-serif !important; font-weight:600 !important;
-    border:none !important; border-radius:12px !important; padding:.8rem 2rem !important; }
-
-[data-testid="stFileUploader"] { border-radius:14px !important;
-    border:2px dashed rgba(99,102,241,.3) !important; background:rgba(99,102,241,.04) !important; }
-[data-testid="stTextInput"] input, [data-testid="stTextArea"] textarea {
-    background:rgba(255,255,255,.04) !important; border:1px solid rgba(255,255,255,.1) !important;
-    border-radius:12px !important; color:#f0f4ff !important; }
-label { color:#94a3b8 !important; font-size:.85rem !important; }
-hr { border-color:rgba(255,255,255,.06) !important; }
+    .main-title {
+        color: #9400D3;
+        text-align: center;
+        font-size: 40px;
+        font-weight: bold;
+        margin-bottom: 10px;
+    }
+    .subtitle {
+        color: #ffffff;
+        text-align: center;
+        font-size: 18px;
+        margin-bottom: 20px;
+    }
+    .section-title {
+        color: #ffffff;
+        font-size: 24px;
+        font-weight: bold;
+        margin-top: 30px;
+        margin-bottom: 15px;
+        border-bottom: 2px solid rgba(255,255,255,0.3);
+        padding-bottom: 5px;
+    }
+    .score-container {
+        background: rgba(255, 255, 255, 0.1);
+        backdrop-filter: blur(10px);
+        padding: 20px;
+        border-radius: 12px;
+        text-align: center;
+        font-size: 24px;
+        font-weight: bold;
+        color: #ffffff;
+        margin-top: 20px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+    .text-container {
+        height: 300px;
+        overflow-y: scroll;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 8px;
+        padding: 15px;
+        background: rgba(0, 0, 0, 0.2);
+        white-space: pre-wrap;
+        box-shadow: inset 0 2px 4px rgba(0,0,0,0.1);
+        color: #ffffff !important;
+    }
+    .stProgress > div > div > div > div {
+        background-color: #27ae60;
+    }
+    .metric-card {
+        background: rgba(255, 255, 255, 0.1);
+        backdrop-filter: blur(10px);
+        border-radius: 8px;
+        padding: 15px;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        text-align: center;
+        margin-bottom: 10px;
+    }
+    .metric-card h4 {
+        margin: 0;
+        color: #e0e0e0 !important;
+        font-size: 16px;
+    }
+    .metric-card h2 {
+        margin: 10px 0 0 0;
+        color: #ffffff !important;
+        font-size: 28px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session State ─────────────────────────────
-for k, v in [('page', 'home'), ('results', None)]:
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-def nav(page):
-    st.session_state.page = page
-    st.rerun()
-
-# ── Helpers ───────────────────────────────────
+# -------------------------------
+# Core Data Extraction Logic
+# -------------------------------
 def extract_text(file):
-    reader = PdfReader(file)
-    return "\n".join(p.extract_text() or "" for p in reader.pages)
+    text = ""
+    ocr_missing = False
+    st.session_state.extraction_logs = []
 
-def ats_score(resume, job):
-    vec = TfidfVectorizer(stop_words='english')
-    tfidf = vec.fit_transform([resume.lower(), job.lower()])
-    return round(cosine_similarity(tfidf)[0][1] * 100, 1)
+    if file.type == "application/pdf":
+        try:
+            # Using PyMuPDF (fitz) - No Poppler required!
+            doc = fitz.open(stream=file.read(), filetype="pdf")
+            for idx, page in enumerate(doc):
+                page_text = page.get_text()
+                
+                if page_text and page_text.strip():
+                    text += page_text + "\n"
+                else:
+                    # OCR Fallback for Scanned PDFs (Native to PyMuPDF)
+                    try:
+                        # Render page to image at high res (300 DPI)
+                        pix = page.get_pixmap(dpi=300)
+                        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                        img_np = np.array(img)
+                        
+                        # 1. Try RapidOCR
+                        ocr_engine = get_ocr_engine()
+                        page_captured = False
+                        if ocr_engine:
+                            result, _ = ocr_engine(img_np)
+                            if result:
+                                text += "\n".join([line[1] for line in result]) + "\n"
+                                page_captured = True
+                        
+                        # 2. Try EasyOCR (Stronger)
+                        if not page_captured and EASYOCR_AVAILABLE:
+                            reader = get_easyocr_reader()
+                            if reader:
+                                results = reader.readtext(img_np)
+                                if results:
+                                    text += "\n".join([res[1] for res in results]) + "\n"
+                                    page_captured = True
+                                    
+                        # 3. Try Pytesseract
+                        if not page_captured and PYTESSERACT_AVAILABLE:
+                            text += pytesseract.image_to_string(img)
+                            if text.strip(): page_captured = True
+                            
+                        if not page_captured:
+                            ocr_missing = True
+                    except Exception as e:
+                        st.session_state.extraction_logs.append(f"P{idx+1} OCR Error: {str(e)}")
+                        ocr_missing = True
+            doc.close()
+        except Exception as e:
+            st.session_state.extraction_logs.append(f"PDF Error: {str(e)}")
+            return ""
 
-def get_keywords(text, n=12):
-    vec = TfidfVectorizer(stop_words='english', max_features=n)
-    vec.fit([text])
-    return list(vec.get_feature_names_out())
+    elif file.type.endswith("document.wordprocessingml.document"):
+        try:
+            doc = docx.Document(file)
+            for p in doc.paragraphs:
+                if p.text: text += p.text + "\n"
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        if cell.text: text += cell.text + "\n"
+        except Exception as e:
+            st.session_state.extraction_logs.append(f"DOCX Error: {str(e)}")
 
-def score_color(score):
-    if score >= 75:   return "#34d399", "Strong Match 🎯"
-    elif score >= 50: return "#f59e0b", "Good Match ⚡"
-    else:             return "#f43f5e", "Needs Work 🔧"
+    elif file.type.startswith("image"):
+        try:
+            img = Image.open(file)
+            img_np = np.array(img.convert('RGB'))
+            page_captured = False
+            
+            ocr_engine = get_ocr_engine()
+            if ocr_engine:
+                result, _ = ocr_engine(img_np)
+                if result: 
+                    text += "\n".join([line[1] for line in result]) + "\n"
+                    page_captured = True
+            
+            if not page_captured and EASYOCR_AVAILABLE:
+                reader = get_easyocr_reader()
+                if reader:
+                    results = reader.readtext(img_np)
+                    if results:
+                        text += "\n".join([res[1] for res in results]) + "\n"
+                        page_captured = True
 
-# ── Rule-based Resume Optimizer ───────────────
-WEAK_VERBS = {
-    r'\bworked on\b': 'Developed', r'\bhelped\b': 'Assisted', r'\bdid\b': 'Executed',
-    r'\bwas responsible for\b': 'Managed', r'\bresponsible for\b': 'Owned',
-    r'\bmade\b': 'Created', r'\bhandled\b': 'Managed', r'\bused\b': 'Leveraged',
-    r'\bknowledge of\b': 'Proficient in', r'\bfamiliar with\b': 'Experienced with',
-}
+            if not page_captured and PYTESSERACT_AVAILABLE:
+                res = pytesseract.image_to_string(img)
+                if res.strip():
+                    text += res
+                    page_captured = True
 
-def optimize_line(line):
-    for pattern, replacement in WEAK_VERBS.items():
-        line = re.sub(pattern, replacement, line, flags=re.IGNORECASE)
-    return line
+            if not page_captured: ocr_missing = True
+        except Exception as e:
+            st.session_state.extraction_logs.append(f"Image Error: {str(e)}")
+            ocr_missing = True
+            
+    if ocr_missing:
+        st.session_state.extraction_logs.append("⚠️ Could not read text from some pages. Ensure they are clear.")
 
-def inject_keywords(text, keywords):
-    skills_section = re.search(r'(skill|technical|competenc)', text, re.IGNORECASE)
-    if skills_section:
-        kw_line = "\nKey Competencies: " + " | ".join(k.title() for k in keywords[:8])
-        pos = skills_section.start()
-        text = text[:pos] + kw_line + "\n" + text[pos:]
     return text
 
-def add_summary(text, role, keywords):
-    summary = (
-        f"\n=== PROFESSIONAL SUMMARY ===\n"
-        f"Results-driven professional targeting the role of {role}. "
-        f"Demonstrated expertise in {', '.join(keywords[:4])}. "
-        f"Proven ability to deliver impactful outcomes through strategic thinking and execution.\n"
-    )
-    # Insert summary at top (after name/contact if any, roughly after first 3 lines)
-    lines = text.strip().split('\n')
-    insert_at = min(3, len(lines))
-    lines.insert(insert_at, summary)
-    return '\n'.join(lines)
+# -------------------------------
+# Detect Resume Sections
+# -------------------------------
+def analyze_resume(text):
+    t = text.lower()
+    has_email = bool(re.search(r'[\w\.-]+@[\w\.-]+', text))
+    has_phone = bool(re.search(r'[\+\(]?[1-9][0-9 .\-\(\)]{8,}[0-9]', text))
+    has_linkedin = "linkedin.com" in t
 
-def optimize_resume(resume_text, role, keywords):
-    lines = resume_text.split('\n')
-    optimized = []
-    has_summary = bool(re.search(r'summary|objective|profile', resume_text, re.IGNORECASE))
+    sections_found = {
+        "Contact Info": has_email or has_phone or has_linkedin,
+        "Skills": bool(re.search(r'\b(skills|technical|technologies|proficiencies|expertise|knowledge)\b', t)),
+        "Experience": bool(re.search(r'\b(experience|work history|employment|career|professional background)\b', t)),
+        "Education": bool(re.search(r'\b(education|academic|university|degree|qualifications)\b', t)),
+        "Projects": bool(re.search(r'\b(projects|portfolio|personal work|accomplishments)\b', t)),
+        "Summary": bool(re.search(r'\b(summary|objective|profile|about me|professional profile)\b', t))
+    }
+    return sections_found
 
-    for line in lines:
-        line = optimize_line(line)
-        # Quantify unquantified bullets if no numbers present
-        if line.strip().startswith(('•', '-', '*')) and not re.search(r'\d', line):
-            line = line.rstrip('.') + ', improving outcomes by 15–20%.'
-        optimized.append(line)
+# -------------------------------
+# Resume Score Calculation
+# -------------------------------
+def calculate_score(sections, text, target_role=""):
+    details = {}
+    t = text.lower()
+    tr = target_role.lower()
 
-    result = '\n'.join(optimized)
+    formatting = 0
+    if len(text.split("\n")) > 12: formatting += 10
+    if any(char in text for char in ["•", "-", "*", "·", "▪", "–", "—"]): formatting += 10
+    details["Formatting"] = formatting
 
-    if not has_summary:
-        result = add_summary(result, role, keywords)
+    content = 0
+    words = len(text.split())
+    if words > 200: content += 10
+    if sections.get("Contact Info", False): content += 10
+    details["Content"] = content
 
-    result = inject_keywords(result, keywords)
-    return result
+    skills_score = 0
+    if sections.get("Skills", False): skills_score += 10
+    keywords = [
+        "python", "java", "javascript", "react", "node", "sql", "nosql", "aws",
+        "azure", "docker", "kubernetes", "machine learning", "data", "ai", "agile", "scrum", "git", "ci/cd", 
+        "project management", "leadership", "communication", "problem solving", "analytics"
+    ]
+    # Add words from target role
+    role_words = [w for w in tr.split() if len(w) > 3]
+    keywords.extend(role_words)
 
-# ── PDF Builder ───────────────────────────────
-def build_pdf(text, orig_score, new_score, role):
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=letter,
-                            leftMargin=.7*inch, rightMargin=.7*inch,
-                            topMargin=.7*inch, bottomMargin=.7*inch)
-    styles = getSampleStyleSheet()
-    story = []
+    matches = [kw for kw in keywords if kw in t]
+    skills_score += min(20, len(matches) * 2) 
+    details["Skills"] = skills_score
 
-    hdr = ParagraphStyle('H', parent=styles['Normal'], fontSize=9,
-                         textColor=colors.HexColor('#6366f1'), alignment=TA_CENTER,
-                         fontName='Helvetica-Bold', spaceAfter=4)
-    story.append(Paragraph(f"ATS-OPTIMIZED  |  TARGET: {role.upper()}", hdr))
-    story.append(HRFlowable(width="100%", thickness=1,
-                             color=colors.HexColor('#6366f1'), spaceAfter=8))
+    exp_score = 0
+    if sections.get("Experience", False): exp_score += 15
+    impact_verbs = ["managed", "led", "developed", "increased", "reduced", "spearheaded", "optimized", "implemented"]
+    if any(v in t for v in impact_verbs): exp_score += 5
+    if re.search(r'\d+%', text) or re.search(r'\$\d+', text) or re.search(r'\b(years|months)\b', t):
+        exp_score += 10
+    details["Experience"] = exp_score
 
-    score_style = ParagraphStyle('S', parent=styles['Normal'], fontSize=8.5,
-                                  textColor=colors.HexColor('#10b981'),
-                                  alignment=TA_CENTER, spaceAfter=14)
-    story.append(Paragraph(
-        f"Original ATS Score: {orig_score}%  →  Optimized: {new_score}%  ✔ ResumeIQ", score_style))
+    total = formatting + content + skills_score + exp_score
+    return details, min(total, 100)
 
-    sec_style = ParagraphStyle('Sec', parent=styles['Heading2'], fontSize=11,
-                                fontName='Helvetica-Bold',
-                                textColor=colors.HexColor('#1e3a8a'),
-                                spaceBefore=12, spaceAfter=4)
-    body = ParagraphStyle('B', parent=styles['Normal'], fontSize=9.5,
-                           leading=15, textColor=colors.HexColor('#1e293b'), spaceAfter=3)
-    bul  = ParagraphStyle('BL', parent=styles['Normal'], fontSize=9.5,
-                           leading=15, textColor=colors.HexColor('#334155'),
-                           leftIndent=14, spaceAfter=2)
+# -------------------------------
+# Suggestions
+# -------------------------------
+def generate_suggestions(sections, text, target_role=""):
+    suggestions = []
+    if target_role:
+        suggestions.append(f"Tailor your summary to highlight qualifications for the '{target_role}' role.")
+    if not sections["Summary"]:
+        suggestions.append("Add a professional summary at the top.")
+    if not sections["Skills"]:
+        suggestions.append("Include a technical skills section.")
+    if target_role:
+        tr_words = [w for w in target_role.lower().split() if len(w) > 3]
+        missing_role_words = [w for w in tr_words if w not in text.lower()]
+        if missing_role_words:
+            suggestions.append(f"Consider adding role-specific skills: {', '.join(missing_role_words)}")
+    if not sections["Projects"]:
+        suggestions.append("Add a projects section to show practical application.")
+    if not re.search(r'\d+', text):
+        suggestions.append("Quantify achievements (e.g., 'improved speed by 30%').")
+    return suggestions
 
-    for line in text.strip().split('\n'):
+# -------------------------------
+# Extract Bullet Points
+# -------------------------------
+def extract_bullets(text):
+    bullets = []
+    bullet_chars = ("•", "-", "*", "·", "▪", "–", "—", ">", "o ", "e ", "■", "♦")
+    for line in text.split("\n"):
         line = line.strip()
-        if not line:
-            story.append(Spacer(1, 4)); continue
-        if line.startswith('===') and line.endswith('==='):
-            story.append(Paragraph(line.replace('=','').strip(), sec_style))
-            story.append(HRFlowable(width="100%", thickness=.5,
-                                     color=colors.HexColor('#e2e8f0'), spaceAfter=4))
-        elif line.startswith(('- ','• ','* ')):
-            story.append(Paragraph('• ' + line.lstrip('-•* '), bul))
+        if len(line.split()) >= 5:
+            if line.startswith(bullet_chars) or re.match(r'^[A-Z][a-z]+ed\b', line):
+                bullets.append(line)
+    return list(dict.fromkeys(bullets))[:15]
+
+# -------------------------------
+# Deep Analysis & Rewrite of Bullet Points
+# -------------------------------
+def improve_bullets(bullets, target_role="", jd_text=""):
+    improved = []
+    context_text = f"{target_role} {jd_text}".lower()
+    words = re.sub(f'[{re.escape(string.punctuation)}]', ' ', context_text).split()
+    stop_words = {"the", "and", "to", "of", "in", "for", "is", "with", "on", "as", "an", "at", "it", "or", "from", "be", "are", "you", "your", "we", "our"}
+    role_keywords = list(set([w for w in words if w not in stop_words and len(w) > 3]))
+    
+    selected_bullets = random.sample(bullets, min(len(bullets), 5))
+    if not selected_bullets and target_role:
+        return [] # Downstream will handle fallback
+
+    for bullet in selected_bullets:
+        clean_bullet = re.sub(r'^[\s\•\-\*\·\▪\–\—\>]+', '', bullet).strip()
+        bullet_words = clean_bullet.split()
+        first_word = bullet_words[0].lower() if bullet_words else ""
+        has_metrics = bool(re.search(r'\d+', clean_bullet) or '%' in clean_bullet)
+        
+        weak_to_strong = {"helped": "Spearheaded", "worked": "Engineered", "did": "Executed", "managed": "Optimized", "led": "Pioneered", "used": "Leveraged"}
+        suggestions = []
+        rewrite = clean_bullet
+        
+        if first_word in weak_to_strong:
+            strong = weak_to_strong[first_word]
+            suggestions.append(f"- Use '{strong}' instead of '{first_word}'.")
+            rewrite = re.sub(rf'^{first_word}', strong, rewrite, count=1, flags=re.IGNORECASE)
+            
+        if not has_metrics:
+            impact = random.choice(["resulting in 20% efficiency gain.", "reducing processing time by 15%.", "saving $5k in monthly overhead."])
+            suggestions.append("- Add numerical impact.")
+            rewrite = rewrite.rstrip('.') + f", {impact}"
+            
+        if role_keywords:
+            kw = random.choice(role_keywords).capitalize()
+            if kw.lower() not in rewrite.lower():
+                suggestions.append(f"- Align to '{target_role}' by mentioning '{kw}'.")
+                rewrite = rewrite.rstrip('.') + f" while maintaining {kw} standards."
+
+        improved.append(f"*{clean_bullet}*\n  **Analysis:**\n  {chr(10).join(suggestions)}\n\n  [REWRITE]: {rewrite}")
+    return improved
+
+def generate_fallback_bullets(text, target_role=""):
+    base = target_role if target_role else "Professional"
+    return [
+        f"Spearheaded {base} initiatives resulting in a 25% increase in operational throughput.",
+        f"Optimized core workflows for {base} environments, reducing error rates by 15%.",
+        f"Collaborated on {base} projects, delivering results 10% ahead of schedule.",
+        f"Engineered scalable solutions tailored to {base} standards.",
+        f"Pioneered data-driven strategies for {base} excellence."
+    ]
+
+def ats_match(resume_text, jd_text, target_role=""):
+    full_target = f"{target_role} {jd_text}"
+    if not full_target.strip(): return 0
+    def clean(text):
+        text = text.lower()
+        text = re.sub(f'[{re.escape(string.punctuation)}]', ' ', text)
+        stop = {"the", "and", "to", "of", "in", "for", "is", "with", "on", "as", "an", "at", "by", "this", "it", "or", "from", "be", "are", "we", "our"}
+        return {w for w in text.split() if w not in stop and len(w) > 2}
+    res_w = clean(resume_text)
+    jd_w = clean(full_target)
+    if not jd_w: return 0
+    match = len(res_w.intersection(jd_w))
+    role_w = clean(target_role)
+    role_m = len(res_w.intersection(role_w))
+    perc = ((match + role_m) / (len(jd_w) + max(1, len(role_w)))) * 100
+    return min(100, round(perc * 1.5))
+
+# -------------------------------
+# Dashboard Rendering
+# -------------------------------
+def set_bg_from_local(image_file, blur=False, font_color=None):
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    absolute_path = os.path.join(base_path, image_file)
+    encoded = ""
+    if os.path.exists(absolute_path):
+        with open(absolute_path, "rb") as f: encoded = base64.b64encode(f.read()).decode()
+    css = "<style>\n.stApp {\n"
+    if encoded: css += f"background-image: url(data:image/png;base64,{encoded});\n"
+    else: css += "background: radial-gradient(circle, #2C5364 0%, #0F2027 100%);\n"
+    css += "background-size: cover; background-position: center; background-attachment: fixed; }\n"
+    if blur:
+        css += """
+        .block-container {
+            backdrop-filter: blur(15px); -webkit-backdrop-filter: blur(15px);
+            background-color: rgba(50, 80, 90, 0.7); border-radius: 20px;
+            padding: 3rem !important; border: 1px solid rgba(255,255,255,0.1);
+        }
+        """
+    if font_color:
+        css += f".block-container * {{ color: {font_color} !important; }}\n"
+        css += "[data-testid='stFileUploadDropzone'] * { color: #ffffff !important; }\n"
+    css += "</style>"
+    st.markdown(css, unsafe_allow_html=True)
+
+# -------------------------------
+# SIDEBAR DIAGNOSTICS
+# -------------------------------
+with st.sidebar:
+    st.markdown("### 🛠️ System Status")
+    env_type = "Windows (Local)" if os.name == 'nt' else "Linux (Cloud)"
+    st.caption(f"Environment: {env_type}")
+    
+    with st.expander("Diagnostics"):
+        st.write("PyMuPDF: ✅ Active")
+        
+        # RapidOCR check
+        if RAPIDOCR_AVAILABLE: st.write("RapidOCR: ✅ Found")
         else:
-            story.append(Paragraph(line, body))
-
-    story.append(Spacer(1, 16))
-    ft = ParagraphStyle('F', parent=styles['Normal'], fontSize=7.5,
-                         textColor=colors.HexColor('#94a3b8'), alignment=TA_CENTER)
-    story.append(Paragraph("Generated by ResumeIQ ATS Optimizer", ft))
-    doc.build(story)
-    buf.seek(0)
-    return buf
-
-# ══════════════════════════════════════════════
-# PAGE: HOME
-# ══════════════════════════════════════════════
-if st.session_state.page == 'home':
-    st.markdown('<div class="brand">⚡ ResumeIQ</div>', unsafe_allow_html=True)
-    st.markdown("---")
-    st.markdown("""
-    <h1 class="hero-title">Beat Every <span>ATS Filter</span><br>Land the Interview</h1>
-    <p class="hero-sub">Upload your resume, target a role, and our optimizer rewrites it to pass ATS systems and impress hiring managers — no API key needed.</p>
-    <br>
-    """, unsafe_allow_html=True)
-
-    c1, c2, c3 = st.columns(3)
-    for col, icon, title, desc in [
-        (c1, "🔍", "Deep ATS Scan",   "TF-IDF cosine similarity scoring against your target role."),
-        (c2, "✍️", "Smart Rewrite",   "Rule-based optimizer injects keywords, action verbs & metrics."),
-        (c3, "📥", "PDF Export",      "Download a clean, recruiter-ready PDF instantly."),
-    ]:
-        col.markdown(f'<div class="card" style="text-align:center"><div style="font-size:2rem">{icon}</div>'
-                     f'<strong style="font-family:Syne,sans-serif">{title}</strong>'
-                     f'<p style="color:#64748b;font-size:.82rem;margin-top:.4rem">{desc}</p></div>',
-                     unsafe_allow_html=True)
-
-    st.markdown("<br>")
-    _, mid, _ = st.columns([2, 1, 2])
-    with mid:
-        if st.button("Get Started →", use_container_width=True):
-            nav('analyzer')
-
-# ══════════════════════════════════════════════
-# PAGE: ANALYZER
-# ══════════════════════════════════════════════
-elif st.session_state.page == 'analyzer':
-    st.markdown('<div class="brand">⚡ ResumeIQ</div>', unsafe_allow_html=True)
-    st.markdown("---")
-    st.markdown("### Set Up Your Analysis")
-    st.markdown('<p style="color:#64748b">Enter your target role and upload your resume to begin.</p>', unsafe_allow_html=True)
-    st.markdown("<br>")
-
-    col_l, col_r = st.columns(2, gap="large")
-
-    with col_l:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        role = st.text_input("🎯 Target Job Role", placeholder="e.g. Data Scientist, Product Manager…")
-        job_desc = st.text_area("📋 Job Description (optional but recommended)",
-                                placeholder="Paste job description for better keyword matching…", height=160)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with col_r:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        uploaded = st.file_uploader("📄 Upload Resume (PDF)", type=["pdf"])
-        if uploaded:
-            st.success(f"✓ **{uploaded.name}** uploaded successfully")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown("<br>")
-    _, mid, _ = st.columns([1, 1.5, 1])
-    with mid:
-        if st.button("⚡ Analyze & Optimize Resume", use_container_width=True):
-            if not role:
-                st.error("Please enter a target job role.")
-            elif not uploaded:
-                st.error("Please upload your resume PDF.")
+            st.write("RapidOCR: ❌ Missing")
+            if os.name == 'nt': st.caption("Run: pip install rapidocr-onnxruntime")
+            else: st.caption("Missing libgl1 in packages.txt?")
+        
+        # Tesseract check with Manual Override
+        tess_path = getattr(pytesseract.pytesseract, 'tesseract_cmd', 'tesseract')
+        if shutil.which(tess_path) or (os.path.exists(tess_path) if os.name == 'nt' else False):
+            st.write("Tesseract: ✅ Found")
+            st.caption(f"Path: {tess_path}")
+        else:
+            st.write("Tesseract: ❌ Bin Missing")
+            if os.name == 'nt':
+                st.info("I couldn't find Tesseract automatically. Please paste the path below:")
+                new_path = st.text_input("Manual Tesseract Path", 
+                                       value=st.session_state.get("manual_tess_path", r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
+                                       key="manual_tess_path_input")
+                if st.button("Apply & Verify Path"):
+                    st.session_state["manual_tess_path"] = new_path
+                    st.rerun()
+                st.link_button("Download Tesseract (.exe)", "https://github.com/UB-Mannheim/tesseract/wiki")
             else:
-                with st.spinner("Scanning ATS compatibility and optimizing your resume…"):
-                    resume_text = extract_text(uploaded)
-                    job_context = f"{role}. {job_desc}" if job_desc else role
-                    keywords    = get_keywords(job_context, n=12)
+                st.caption("Add tesseract-ocr to packages.txt")
 
-                    orig_score  = ats_score(resume_text, job_context)
-                    rewritten   = optimize_resume(resume_text, role, keywords)
-                    new_score   = min(ats_score(rewritten, job_context), 98.0)
+    if st.button("Reset App"):
+        for key in list(st.session_state.keys()): del st.session_state[key]
+        st.rerun()
 
-                    suggestions = [
-                        f"Integrated keywords: {', '.join(keywords[:5])}",
-                        "Replaced weak verbs with strong action verbs (Developed, Managed, Led…)",
-                        "Added quantified impact to unmetricized bullet points",
-                        f"Injected Professional Summary tailored to {role}",
-                        "Added key competencies section with role-relevant skills",
-                    ]
-                    if job_desc:
-                        suggestions.append(f"Mirrored JD language: {', '.join(keywords[5:9])}")
+# -------------------------------
+# PAGE 1 : Upload
+# -------------------------------
+if "page" not in st.session_state: st.session_state.page = "upload"
 
-                    st.session_state.results = dict(
-                        role=role, original_score=orig_score, new_score=new_score,
-                        suggestions=suggestions, keywords=keywords,
-                        rewritten_text=rewritten, job_desc=job_context
-                    )
-                    nav('results')
+if st.session_state.page == "upload":
+    set_bg_from_local("background.png", blur=True, font_color="#ffffff")
+    st.markdown('<div class="main-title">📄 Resume Analyzer & Improver</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">Enter your target job role, then upload your resume for ATS analysis.</div>', unsafe_allow_html=True)
+    st.markdown("### 1. Target Job Role")
+    st.markdown("What job role are you applying for? (e.g., Python Developer, Data Scientist)")
+    tr = st.text_input("target_role", label_visibility="collapsed", placeholder="Enter job role...")
+    st.markdown("### 2. Job Description (Optional)")
+    st.markdown("Paste the Job Description (JD) here for a more precise match.")
+    jd = st.text_area("jd", label_visibility="collapsed", height=150)
+    st.markdown("### 3. Upload Resume")
+    st.markdown("Upload your resume in PDF, DOCX, JPG, or PNG format.")
+    file = st.file_uploader("Upload Resume", type=["pdf","docx","jpg","png"], label_visibility="collapsed")
+    if file and st.button("🔍 Analyze Resume", use_container_width=True):
+        st.session_state.text = extract_text(file)
+        st.session_state.target_role = tr
+        st.session_state.jd = jd
+        st.session_state.page = "analysis"
+        st.rerun()
 
-    if st.button("← Back to Home"):
-        nav('home')
+# -------------------------------
+# PAGE 2 : Analysis
+# -------------------------------
+elif st.session_state.page == "analysis":
+    set_bg_from_local("background2.png", blur=True, font_color="#ffffff")
+    text = st.session_state.text
+    tr = st.session_state.target_role
+    jd = st.session_state.jd
 
-# ══════════════════════════════════════════════
-# PAGE: RESULTS
-# ══════════════════════════════════════════════
-elif st.session_state.page == 'results':
-    res = st.session_state.results
-    if not res: nav('home')
+    st.markdown(f'<div class="section-title">Analysis Executive Summary {f"for {tr}" if tr else ""}</div>', unsafe_allow_html=True)
+    
+    # 📝 Show extraction logs ALWAYS if they exist (for debugging)
+    if st.session_state.get('extraction_logs'):
+        with st.expander("📝 View Extraction Warnings (Debug Info)", expanded=True):
+            for log in st.session_state['extraction_logs']:
+                st.warning(log)
+    
+    words = len(text.split())
+    if words < 50:
+        st.error("🚨 Error: No text could be extracted. Please ensure the file is not corrupted or scanned without OCR support.")
+        if st.button("Try Another"):
+            st.session_state.page = "upload"; st.rerun()
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write(f"**Word Count**: {words}")
+            st.write(f"**Readability**: {'High' if words > 300 else 'Medium'}")
+        with c2:
+            sc = analyze_resume(text)
+            det = [k for k, v in sc.items() if v]
+            st.write(f"**Sections Found**: {len(det)} / 6")
+            st.write(f"**Status**: {'Ready for ATS' if len(det) >= 4 else 'Needs Improvement'}")
 
-    st.markdown('<div class="brand">⚡ ResumeIQ</div>', unsafe_allow_html=True)
-    st.markdown("---")
-    st.markdown(f"### Analysis Complete 🎉")
-    st.markdown(f'<p style="color:#64748b">Optimized for <strong style="color:#e2e8f0">{res["role"]}</strong></p>',
-                unsafe_allow_html=True)
-    st.markdown("<br>")
+        if tr or jd:
+            st.markdown('<div class="section-title">Target Job ATS Match Score</div>', unsafe_allow_html=True)
+            score = ats_match(text, jd, tr)
+            st.progress(score)
+            st.markdown(f"### ATS Match to **{tr if tr else 'JD'}**: **{score}%**")
 
-    orig, new, role = res['original_score'], res['new_score'], res['role']
-    col_hex, verdict = score_color(new)
+        st.markdown('<div class="section-title">Extracted Resume Text</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="text-container">{html.escape(text)}</div>', unsafe_allow_html=True)
 
-    col_s, col_r = st.columns([1, 2], gap="large")
+        st.markdown('<div class="section-title">Resume Overview Score</div>', unsafe_allow_html=True)
+        det_s, tot_s = calculate_score(sc, text, tr)
+        cl1, cl2 = st.columns(2)
+        m_style = "<div class='metric-card'><h4>{}</h4><h2>{} <span style='font-size:16px;color:#e0e0e0;'>/ {}</span></h2></div>"
+        with cl1:
+            st.markdown(m_style.format("Formatting", det_s['Formatting'], 20), unsafe_allow_html=True)
+            st.markdown(m_style.format("Content Quality", det_s['Content'], 30), unsafe_allow_html=True)
+        with cl2:
+            st.markdown(m_style.format("Skills Relevance", det_s['Skills'], 25), unsafe_allow_html=True)
+            st.markdown(m_style.format("Experience Impact", det_s['Experience'], 25), unsafe_allow_html=True)
+        st.progress(tot_s)
+        st.markdown(f'<div class="score-container">Final Resume Score: {tot_s} / 100</div>', unsafe_allow_html=True)
 
-    with col_s:
-        st.markdown(f"""
-        <div class="card" style="text-align:center">
-            <p style="color:#64748b;font-size:.78rem;text-transform:uppercase;letter-spacing:.1em">Before</p>
-            <div style="font-family:Syne,sans-serif;font-size:2.5rem;font-weight:700;color:#64748b">{orig}%</div>
-            <div style="color:#475569;font-size:1.2rem;margin:.5rem 0">↓</div>
-            <p style="color:#64748b;font-size:.78rem;text-transform:uppercase;letter-spacing:.1em">After</p>
-            <div class="score-num" style="color:{col_hex}">{new}%</div>
-            <div style="background:rgba(255,255,255,.06);border-radius:99px;height:6px;margin:.75rem 0;overflow:hidden">
-                <div style="width:{new}%;height:100%;background:{col_hex};border-radius:99px"></div>
-            </div>
-            <span class="badge" style="background:{col_hex}22;color:{col_hex};border:1px solid {col_hex}44">{verdict}</span>
-            <p style="color:#64748b;font-size:.78rem;margin-top:.75rem">+{round(new-orig,1)}% improvement</p>
-        </div>
-        """, unsafe_allow_html=True)
+        # -------------------------------
+        # Suggestions
+        # -------------------------------
+        st.markdown('<div class="section-title">Improvement Suggestions</div>', unsafe_allow_html=True)
+        suggestions = generate_suggestions(sc, text, tr)
+        if suggestions:
+            for s in suggestions:
+                st.info(s)
+        else:
+            st.success("Your resume structure looks strong!")
 
-    with col_r:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("**💡 Applied Optimizations**")
-        icons = ["🔑","📊","⚡","✍️","🎯","🔗"]
-        for i, s in enumerate(res['suggestions']):
-            st.markdown(f"<div style='padding:.6rem 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:.88rem;color:#cbd5e1'>"
-                        f"{icons[i%len(icons)]} {s}</div>", unsafe_allow_html=True)
-        st.markdown("<br><p style='color:#475569;font-size:.75rem;text-transform:uppercase;letter-spacing:.08em'>Keywords Integrated</p>", unsafe_allow_html=True)
-        chips = "".join(f'<span class="chip">{k}</span>' for k in res['keywords'])
-        st.markdown(f'<div style="margin-top:.4rem">{chips}</div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        # -------------------------------
+        # Bullet Improvements
+        # -------------------------------
+        st.markdown('<div class="section-title">Target Role Driven Bullet Rewrite</div>', unsafe_allow_html=True)
+        bul = extract_bullets(text)
+        imp_bul = improve_bullets(bul, tr, jd) if bul else []
+        final_bul = imp_bul if imp_bul else [f"- {b}" for b in generate_fallback_bullets(text, tr)]
+        for b in final_bul: st.markdown(b)
 
-    st.markdown("<br>")
-    with st.expander("📄 Area where to imporove for better results "):
-        st.text_area("", value=res['rewritten_text'], height=300, label_visibility="collapsed")
-
-    st.markdown("<br>")
-    pdf = build_pdf(res['rewritten_text'], orig, new, role)
-    _, mid, _ = st.columns([1, 1.5, 1])
-    with mid:
-        st.download_button("⬇️ Download Optimized Resume PDF", data=pdf,
-                           file_name=f"ResumeIQ_{role.replace(' ','_')}_Optimized.pdf",
-                           mime="application/pdf", use_container_width=True)
-        st.markdown("<br>")
-        if st.button("🔄 Analyze Another Resume", use_container_width=True):
-            st.session_state.results = None
-            nav('analyzer')
+        st.markdown("---")
+        report = f"RESUME REPORT: {tr}\nATS Score: {score}%\nOverall: {tot_s}/100\n\nREWRITTEN BULLETS:\n"
+        for b in final_bul:
+            line = b.split("[REWRITE]:")[-1].strip() if "[REWRITE]:" in b else b.replace("- ", "")
+            report += f"- {line}\n"
+        
+        pdf = FPDF(); pdf.add_page(); pdf.set_font("Arial", size=11)
+        pdf.multi_cell(0, 7, report.encode('latin-1', 'replace').decode('latin-1'))
+        st.download_button("📥 Download Report (PDF)", bytes(pdf.output()), f"Resume_Report_{tr}.pdf", "application/pdf")
+        if st.button("Analyze Another"):
+            st.session_state.page = "upload"; st.rerun()
